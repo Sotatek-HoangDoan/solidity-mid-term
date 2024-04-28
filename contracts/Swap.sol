@@ -1,16 +1,11 @@
 // SPDX-License-Identifier: UNLICENSED
 pragma solidity ^0.8.24;
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
 
-contract Swap {
-    /**
-    * Viet mot contract tạo request swap => struct SwapRequest {requester address, amount, tokenA: address, tokenB: address, tokenAAmount, tokenBAmount, status, claims};
-    Tính năng user A create, cancel
-    Tính năng user B approve, reject
-    Có ví treasury và fee
-
-    A cancel, B approve, reject => cần có một cơ chế lưu để đễ truy xuất vào xác nhận => request là array
-    */
+contract Swap is Initializable, OwnableUpgradeable, UUPSUpgradeable {
     enum SwapRequestStatus {
         Created,
         Approved,
@@ -29,17 +24,28 @@ contract Swap {
     }
 
     SwapRequest[] public requests;
-    mapping(address => uint[]) public ownerToRequests;
-    mapping(address => uint[]) public partnerToRequests;
     address public treasury;
-    uint constant fee = 500;
+    uint public fee; // fee * DESCRIMINATOR
+    uint constant DESCRIMINATOR = 10000;
 
-    event SwapRequestCreated(address _requester, address _partner, address _payToken, uint _payAmount, address _requestToken, uint _requestAmount);
+    event SwapRequestCreated(SwapRequest _request, uint _index);
     event SwapRequestApproved(SwapRequest _request);
     event SwapRequestRejected(SwapRequest _request);
     event SwapRequestCancelled(SwapRequest _request);
 
-    constructor(address _treasury) {
+    function initialize (address _owner, address _treasury, uint _fee) public initializer {
+        require(_treasury != address(0), "Treasury must be a valid address");
+        treasury = _treasury;
+        fee = _fee;
+        __Ownable_init(_owner);
+    }
+
+    function updateFee(uint _fee) public onlyOwner {
+        fee = _fee;
+    }
+
+    function updateTreasury(address _treasury) public onlyOwner {
+        require(_treasury != address(0), "Treasury must be a valid address");
         treasury = _treasury;
     }
 
@@ -49,37 +55,33 @@ contract Swap {
         address _requestToken,
         uint _payAmount,
         uint _requestAmount
-    ) public returns (bool) {
+    ) public {
         require(_payAmount > 0, "Payment amount should be grater than 0");
         require(_requestAmount > 0, "Payment amount should be grater than 0");
 
-        _create(_partner, _payToken, _requestToken, _payAmount, _requestAmount);
-        emit SwapRequestCreated(msg.sender, _partner, _payToken, _payAmount, _requestToken, _requestAmount);
-        return true;
+        uint index = _create(_partner, _payToken, _requestToken, _payAmount, _requestAmount);
+        emit SwapRequestCreated(requests[index], index);
     }
 
-    function approve(uint _index) public returns (bool) {
+    function approve(uint _index) public {
         require(requests[_index].partner == msg.sender);
         require(requests[_index].status == SwapRequestStatus.Created);
         _approve(_index);
         emit SwapRequestApproved(requests[_index]);
-        return true;
     }
 
-    function reject(uint _index) public returns (bool) {
+    function reject(uint _index) public {
         require(requests[_index].partner == msg.sender);
         require(requests[_index].status == SwapRequestStatus.Created);
         _reject(_index);
         emit SwapRequestRejected(requests[_index]);
-        return true;
     }
 
-    function cancel(uint _index) public returns (bool) {
+    function cancel(uint _index) public {
         require(requests[_index].requester == msg.sender);
         require(requests[_index].status == SwapRequestStatus.Created);
         _cancel(_index);
         emit SwapRequestCancelled(requests[_index]);
-        return true;
     }
 
     function _create(
@@ -88,8 +90,7 @@ contract Swap {
         address _requestToken,
         uint _payAmount,
         uint _requestAmount
-    ) private {
-        IERC20(_payToken).transferFrom(msg.sender, address(this), _payAmount);
+    ) private returns (uint) {
 
         SwapRequest memory request;
         request.requester = msg.sender;
@@ -99,19 +100,18 @@ contract Swap {
         request.payAmount = _payAmount;
         request.requestAmount = _requestAmount;
         request.status = SwapRequestStatus.Created;
-
         requests.push(request);
 
-        uint index = requests.length - 1;
+        IERC20(_payToken).transferFrom(msg.sender, address(this), _payAmount);
 
-        ownerToRequests[msg.sender].push(index);
-        partnerToRequests[_partner].push(index);
+        return requests.length - 1;
     }
 
     function _approve(uint _index) private {
         SwapRequest memory request = requests[_index];
-        uint requestFeeAmount = (request.requestAmount * fee) / 10000;
-        uint payFeeAmount = (request.payAmount * fee) / 10000;
+        requests[_index].status = SwapRequestStatus.Approved;
+        uint requestFeeAmount = request.requestAmount * fee / DESCRIMINATOR;
+        uint payFeeAmount = request.payAmount * fee / DESCRIMINATOR;
         IERC20(request.requestToken).transferFrom(
             request.partner,
             treasury,
@@ -128,18 +128,23 @@ contract Swap {
             request.payAmount - payFeeAmount
         );
 
-        requests[_index].status = SwapRequestStatus.Approved;
     }
 
     function _reject(uint _index) private {
         SwapRequest memory request = requests[_index];
-        IERC20(request.payToken).transfer(request.requester, request.payAmount);
         requests[_index].status = SwapRequestStatus.Rejected;
+        IERC20(request.payToken).transfer(request.requester, request.payAmount);
     }
 
     function _cancel(uint _index) private {
         SwapRequest memory request = requests[_index];
-        IERC20(request.payToken).transfer(request.requester, request.payAmount);
         requests[_index].status = SwapRequestStatus.Cancelled;
+        IERC20(request.payToken).transfer(request.requester, request.payAmount);
     }
+
+    function _authorizeUpgrade(address newImplementation)
+        internal
+        override
+        onlyOwner
+    {}
 }
